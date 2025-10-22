@@ -8,26 +8,96 @@ date: "2025-08-13"
 library(sswidb)
 library(sswids)
 library(dplyr)
+library(ggplot2)
+library(traits)
+library(lubridate)
+library(nnet)
 
 detects <- readRDS("./detectsfinal.rds")
+detects$month <- month(detects$DETECTION_DATETIME, label = TRUE)
+detects$year <- year(detects$DETECTION_DATETIME)
+detects <- detects[grepl(x = detects$CLASS_KEY, pattern = "_AMT$")|is.na(detects$CLASS_KEY),]
+
+
+weightdb <- tr_ernest(read = TRUE)[[1]]%>%select("genus", "species", "common_name", "adult_body_mass_g")
+species2 <- read.csv("./species.csv")
+specieswts <- left_join(species2, weightdb, by = c("genus", "species"))
+specieswts <- specieswts[!is.na(specieswts$adult_body_mass_g),]
+specieswts$kg <- specieswts$adult_body_mass_g/1000
+specieswts <- specieswts%>%mutate(size=case_when(kg < 4 ~ "small",
+                                                 kg > 4 & kg < 12 ~ "medium",
+                                                 kg > 12 ~ "large"))
+
+
+detects <- left_join(detects, specieswts, by=join_by("SPECIES" == "SPECIES_NAME"))
+detects$size <- factor(detects$size, levels=c("small", "medium", "large"))
+detectsV3V4 <- detects%>%filter(version %in% c("V3", "V4"))
+
+detectsbymonth <- split(detectsV3V4, detects$month)
 ```
 
-## R Markdown
+```{r, weight table, echo=FALSE}
+wttable <- specieswts%>%select(SPECIES_NAME, kg, size)
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+wttable%>%
+kableExtra::kbl(digits=2) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  kableExtra::scroll_box(width = "100%", height = "300px")
 ```
 
-## Including Plots
+```{r, message=FALSE, include=FALSE}
+#calculated as size/ndays for each version no variance measure
+detects.byday <- detects%>%group_by(version)%>% mutate(ndays=n())%>%group_by(version,size,ndays)%>%summarise(triggers=sum(COUNT>0, na.rm = TRUE),count=sum(COUNT, na.rm=TRUE))%>%na.omit(size)%>%mutate(triggersperday=triggers/ndays, countperday=count/ndays)
 
-You can also embed plots, for example:
+detects.bydayV3V4 <- detects%>%group_by(version)%>% mutate(ndays=n())%>%group_by(version,size,ndays)%>%summarise(triggers=sum(COUNT>0, na.rm = TRUE),count=sum(COUNT, na.rm=TRUE))%>%na.omit(size)%>%mutate(triggersperday=triggers/ndays, countperday=count/ndays)%>%filter(version %in% c("V3", "V4"))
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r, include=FALSE}
+detectssummary.byday <-detects%>%group_by(version, Date, cam_site_id, size)%>% summarise(triggers=sum(COUNT>0, na.rm = TRUE), count=sum(COUNT, na.rm=TRUE))%>%na.omit(size)%>%group_by(version, size)%>%summarise(avgtriggers=mean(triggers), sdtriggers=sd(triggers), avgcount=mean(count), sdcount=sd(count))
+
+detectssummary.bydayV3V4 <- detects%>%group_by(version, Date, cam_site_id, size)%>% summarise(triggers=sum(COUNT>0, na.rm = TRUE), count=sum(COUNT, na.rm=TRUE))%>%na.omit(size)%>%group_by(version, size)%>%summarise(avgtriggers=mean(triggers), sdtriggers=sd(triggers), avgcount=mean(count), sdcount=sd(count))%>%filter(version %in% c("V3", "V4"))
+
+
+
+```
+
+```{r, echo=FALSE, message=FALSE}
+#Daily (across camera sites) average detections of different size animals
+detects.byday <-detects%>%group_by(version, Date)%>%mutate( ncams=n_distinct(cam_site_id))%>%group_by(version, Date, size)%>% summarise(triggers=sum(COUNT>0, na.rm = TRUE), count=sum(COUNT, na.rm=TRUE), triggerspercam=triggers/unique(ncams), lengthcams=length(unique(ncams)))%>%na.omit(size)
+detects.bydayV3V4 <- detects.byday%>%filter(version %in% c("V3", "V4"))
+ggplot(detects.byday, aes(x=size, y=triggerspercam, color=version)) + geom_boxplot() + labs(title = "Daily Detections of Different Size Wildlife by Camera Version")
+ggplot(detects.byday%>%filter(version != "V1"), aes(x=size, y=triggerspercam, color=version)) + geom_boxplot() + labs(title = "Daily Detections of Different Size Wildlife by Camera Version")
+detects.bydayV3V4%>%group_by(version, size)%>%summarise(avgdetects=mean(triggerspercam), sddetects=sd(triggerspercam))
+
+```
+
+
+```{r}
+chitest <- chisq.test(detectsV3V4$version, detectsV3V4$size)
+chisq.test(detectsV3V4$version, detectsV3V4$size)
+```
+
+```{r, message=FALSE}
+chisq.bymonth <- lapply(detectsbymonth,function (x) chisq.test(x$version, x$size))
+detects.bymonth <-detects%>%group_by(version, month, size)%>% summarise(triggers=sum(COUNT>0, na.rm = TRUE), count=sum(COUNT, na.rm=TRUE))%>%na.omit(size)
+detects.bymonthV3V4 <- detects.bymonth%>%filter(version %in% c("V3", "V4"))
+colnames(detects.bymonthV3V4)[3] <- "AnimalSize"
+detects.bymonthV3V4$SizeVersion <- paste0(detects.bymonthV3V4$AnimalSize, detects.bymonthV3V4$version)
+proplarge <- detects.bymonthV3V4%>%group_by(version, month)%>%mutate(prop=triggers/sum(triggers))%>%filter(AnimalSize=="large")
+
+
+ggplot(proplarge, aes(x=month, y=prop, color=version, group=version)) + geom_line()
+```
+
+
+
+```{r, include=FALSE, eval=FALSE}
+test <- multinom(size ~ version + month, data = detectsV3V4)
+summary(test)
+
+newdata <- data.frame(version = c("V3", "V4"))
+cbind(newdata, predict(test, newdata, "probs"))
+```
+
